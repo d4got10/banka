@@ -14,13 +14,13 @@ const MAX_MESSAGE_BUFFER_SIZE = 2048
 const MAX_MESSAGE_BUFFER_COUNT = 1024 * 1024
 const MAX_MESSAGE_COUNT_PER_BANKA = 1024
 
-type buffer = []byte
-type bufferPointer struct {
+type Buffer = []byte
+type BufferPointer struct {
 	index  int
 	length int
 }
 
-type banka struct {
+type Banka struct {
 	id             int
 	buffer         []byte
 	messageOffsets []int
@@ -30,14 +30,14 @@ type banka struct {
 	sealDate       time.Time
 }
 
-var bankaIsSealedError = errors.New("banka is already sealed")
-var bankaIsFullError = errors.New("banka is already full")
+var bankaIsSealedError = errors.New("Banka is already sealed")
+var bankaIsFullError = errors.New("Banka is already full")
 
-func (banka *banka) isFull() bool {
+func (banka *Banka) isFull() bool {
 	return banka.messageCount == MAX_MESSAGE_COUNT_PER_BANKA
 }
 
-func (banka *banka) putMessage(buffer buffer) error {
+func (banka *Banka) putMessage(buffer Buffer) error {
 	banka.mutex.Lock()
 	defer banka.mutex.Unlock()
 
@@ -61,28 +61,28 @@ func (banka *banka) putMessage(buffer buffer) error {
 	return nil
 }
 
-func newBanka(id int) *banka {
-	return &banka{
+func newBanka(id int) *Banka {
+	return &Banka{
 		id:             id,
 		messageOffsets: make([]int, MAX_MESSAGE_COUNT_PER_BANKA+1),
 	}
 }
 
-type pogreb struct {
-	current *banka
+type Pogreb struct {
+	current *Banka
 	mutex   sync.RWMutex
-	sealed  []*banka
+	sealed  []*Banka
 }
 
-func newPogreb() *pogreb {
-	return &pogreb{
+func newPogreb() *Pogreb {
+	return &Pogreb{
 		current: newBanka(0),
 		mutex:   sync.RWMutex{},
-		sealed:  make([]*banka, 0),
+		sealed:  make([]*Banka, 0),
 	}
 }
 
-func (pogreb *pogreb) putMessage(buffer buffer) error {
+func (pogreb *Pogreb) putMessage(buffer Buffer) error {
 	for {
 		pogreb.mutex.RLock()
 		banka := pogreb.current
@@ -102,13 +102,13 @@ func (pogreb *pogreb) putMessage(buffer buffer) error {
 	}
 }
 
-func (pogreb *pogreb) getCurrentBanka() *banka {
+func (pogreb *Pogreb) getCurrentBanka() *Banka {
 	pogreb.mutex.RLock()
 	defer pogreb.mutex.RUnlock()
 	return pogreb.current
 }
 
-func (pogreb *pogreb) sealCurrentBanka() {
+func (pogreb *Pogreb) sealCurrentBanka() {
 	current := pogreb.current
 	current.isSealed = true
 	current.sealDate = time.Now()
@@ -117,9 +117,9 @@ func (pogreb *pogreb) sealCurrentBanka() {
 	pogreb.current = newBanka(len(pogreb.sealed))
 }
 
-func processBanka(banka *banka) error {
+func processBanka(banka *Banka) error {
 	if !banka.isSealed {
-		return errors.New("can't process banka that is not sealed")
+		return errors.New("can't process Banka that is not sealed")
 	}
 
 	fmt.Printf("Открываем банку с id %d\n", banka.id)
@@ -136,9 +136,9 @@ func processBanka(banka *banka) error {
 }
 
 func main() {
-	messageChannel := make(chan bufferPointer, MAX_MESSAGE_BUFFER_COUNT)
+	messageChannel := make(chan BufferPointer, MAX_MESSAGE_BUFFER_COUNT)
 	freeBuffers := make(chan int, MAX_MESSAGE_BUFFER_COUNT)
-	buffers := make([]buffer, MAX_MESSAGE_BUFFER_COUNT)
+	buffers := make([]Buffer, MAX_MESSAGE_BUFFER_COUNT)
 	for i := 0; i < MAX_MESSAGE_BUFFER_COUNT; i++ {
 		buffers[i] = make([]byte, MAX_MESSAGE_BUFFER_SIZE)
 		freeBuffers <- i
@@ -150,7 +150,7 @@ func main() {
 	go func() {
 		for pointer := range messageChannel {
 			buffer := buffers[pointer.index][:pointer.length]
-			// fmt.Printf("Получено сообщение: %s\n", string(buffer))
+			// fmt.Printf("Получено сообщение: %s\n", string(Buffer))
 
 			err := pogreb.putMessage(buffer)
 			if err != nil {
@@ -194,7 +194,7 @@ func main() {
 	}
 }
 
-func handleConnection(conn net.Conn, messageChannel chan bufferPointer, freeBuffers chan int, buffers []buffer) {
+func handleConnection(conn net.Conn, messageChannel chan BufferPointer, freeBuffers chan int, buffers []Buffer) {
 	defer conn.Close()
 
 	for {
@@ -215,6 +215,6 @@ func handleConnection(conn net.Conn, messageChannel chan bufferPointer, freeBuff
 			break
 		}
 
-		messageChannel <- bufferPointer{index, n}
+		messageChannel <- BufferPointer{index, n}
 	}
 }
