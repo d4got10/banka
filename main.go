@@ -1,14 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
+	"time"
 )
 
-const MAX_BUFFER_SIZE = 2048
-const MAX_BUFFER_COUNT = 1024 * 1024
+const MAX_MESSAGE_BUFFER_SIZE = 2048
+const MAX_MESSAGE_BUFFER_COUNT = 1024 * 1024
+const MAX_MESSAGE_COUNT_PER_BANKA = 1024
 
 type buffer = []byte
 type bufferPointer struct {
@@ -16,20 +20,153 @@ type bufferPointer struct {
 	length int
 }
 
-func main() {
+type banka struct {
+	id             int
+	buffer         []byte
+	messageOffsets []int
+	messageCount   int
+	mutex          sync.Mutex
+	isSealed       bool
+	sealDate       time.Time
+}
 
-	messageChannel := make(chan bufferPointer, MAX_BUFFER_COUNT)
-	freeBuffers := make(chan int, MAX_BUFFER_COUNT)
-	buffers := make([]buffer, MAX_BUFFER_COUNT)
-	for i := 0; i < MAX_BUFFER_COUNT; i++ {
-		buffers[i] = make([]byte, MAX_BUFFER_SIZE)
+var bankaIsSealedError = errors.New("banka is already sealed")
+var bankaIsFullError = errors.New("banka is already full")
+
+func (banka *banka) isFull() bool {
+	return banka.messageCount == MAX_MESSAGE_COUNT_PER_BANKA
+}
+
+func (banka *banka) putMessage(buffer buffer) error {
+	banka.mutex.Lock()
+	defer banka.mutex.Unlock()
+
+	if banka.isSealed {
+		return bankaIsSealedError
+	}
+
+	if banka.isFull() {
+		return bankaIsFullError
+	}
+
+	// TODO: переиспользовать буфферы для банок.
+	banka.buffer = append(banka.buffer, buffer...)
+
+	offset := banka.messageOffsets[banka.messageCount]
+	offset += len(buffer)
+
+	banka.messageCount++
+	banka.messageOffsets[banka.messageCount] = offset
+
+	return nil
+}
+
+func newBanka(id int) *banka {
+	return &banka{
+		id:             id,
+		messageOffsets: make([]int, MAX_MESSAGE_COUNT_PER_BANKA+1),
+	}
+}
+
+type pogreb struct {
+	current *banka
+	mutex   sync.RWMutex
+	sealed  []*banka
+}
+
+func newPogreb() *pogreb {
+	return &pogreb{
+		current: newBanka(0),
+		mutex:   sync.RWMutex{},
+		sealed:  make([]*banka, 0),
+	}
+}
+
+func (pogreb *pogreb) putMessage(buffer buffer) error {
+	for {
+		pogreb.mutex.RLock()
+		banka := pogreb.current
+		err := banka.putMessage(buffer)
+		pogreb.mutex.RUnlock()
+
+		// Если банка заполнена, то закрываем и снова пытаемся положить уже в новую баночку
+		if errors.Is(err, bankaIsFullError) {
+			pogreb.mutex.Lock()
+			if pogreb.current.isFull() {
+				pogreb.sealCurrentBanka()
+			}
+			pogreb.mutex.Unlock()
+		} else {
+			return err
+		}
+	}
+}
+
+func (pogreb *pogreb) getCurrentBanka() *banka {
+	pogreb.mutex.RLock()
+	defer pogreb.mutex.RUnlock()
+	return pogreb.current
+}
+
+func (pogreb *pogreb) sealCurrentBanka() {
+	current := pogreb.current
+	current.isSealed = true
+	current.sealDate = time.Now()
+	// TODO: подумать на фичей хранения запечатанных банок.
+	pogreb.sealed = append(pogreb.sealed, current)
+	pogreb.current = newBanka(len(pogreb.sealed))
+}
+
+func processBanka(banka *banka) error {
+	if !banka.isSealed {
+		return errors.New("can't process banka that is not sealed")
+	}
+
+	fmt.Printf("Открываем банку с id %d\n", banka.id)
+	for i := 0; i < banka.messageCount; i++ {
+		messageStart := banka.messageOffsets[i]
+		messageEnd := banka.messageOffsets[i+1]
+		messageBuffer := banka.buffer[messageStart:messageEnd]
+		message := string(messageBuffer)
+
+		fmt.Printf("[%d]: \"%s\"\n", i, message)
+	}
+
+	return nil
+}
+
+func main() {
+	messageChannel := make(chan bufferPointer, MAX_MESSAGE_BUFFER_COUNT)
+	freeBuffers := make(chan int, MAX_MESSAGE_BUFFER_COUNT)
+	buffers := make([]buffer, MAX_MESSAGE_BUFFER_COUNT)
+	for i := 0; i < MAX_MESSAGE_BUFFER_COUNT; i++ {
+		buffers[i] = make([]byte, MAX_MESSAGE_BUFFER_SIZE)
 		freeBuffers <- i
 	}
+
+	pogreb := newPogreb()
+	processedBankaCount := 0
 
 	go func() {
 		for pointer := range messageChannel {
 			buffer := buffers[pointer.index][:pointer.length]
-			fmt.Printf("Получено сообщение: %s\n", string(buffer))
+			// fmt.Printf("Получено сообщение: %s\n", string(buffer))
+
+			err := pogreb.putMessage(buffer)
+			if err != nil {
+				fmt.Printf("Ошибка при записи в погреб: %s\n", err.Error())
+			}
+
+			fmt.Printf("Количество банок в погребе: %d\n", len(pogreb.sealed))
+			for processedBankaCount < len(pogreb.sealed) {
+				err := processBanka(pogreb.sealed[processedBankaCount])
+				if err != nil {
+					fmt.Printf("Ошибка при обработке банки [%d]: %s\n", processedBankaCount, err.Error())
+				}
+				processedBankaCount++
+			}
+
+			freeBuffers <- pointer.index
 		}
 	}()
 
