@@ -6,13 +6,16 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
-const MAX_MESSAGE_BUFFER_SIZE = 2048
-const MAX_MESSAGE_BUFFER_COUNT = 1024 * 1024
-const MAX_MESSAGE_COUNT_PER_BANKA = 2
+const MaxMessageBufferSize = 2048
+const MaxMessageBufferCount = 1024 * 1024
+const MaxMessageCountPerBanka = 2
+const UserSendQueueCapacity = 1024
 
 type Buffer struct {
 	data       []byte
@@ -34,11 +37,11 @@ type BufferPool struct {
 	buffers     []*PooledBuffer
 }
 
-func newBufferPool() BufferPool {
-	freeBuffers := make(chan int, MAX_MESSAGE_BUFFER_COUNT)
-	buffers := make([]*PooledBuffer, MAX_MESSAGE_BUFFER_COUNT)
-	for i := 0; i < MAX_MESSAGE_BUFFER_COUNT; i++ {
-		buffer := make([]byte, MAX_MESSAGE_BUFFER_SIZE)
+func newBufferPool() *BufferPool {
+	freeBuffers := make(chan int, MaxMessageBufferCount)
+	buffers := make([]*PooledBuffer, MaxMessageBufferCount)
+	for i := 0; i < MaxMessageBufferCount; i++ {
+		buffer := make([]byte, MaxMessageBufferSize)
 		buffers[i] = &PooledBuffer{
 			buffer: &Buffer{
 				data:       buffer,
@@ -49,7 +52,7 @@ func newBufferPool() BufferPool {
 		freeBuffers <- i
 	}
 
-	return BufferPool{
+	return &BufferPool{
 		freeBuffers: freeBuffers,
 		buffers:     buffers,
 	}
@@ -78,7 +81,7 @@ var bankaIsSealedError = errors.New("banka is already sealed")
 var bankaIsFullError = errors.New("banka is already full")
 
 func (banka *Banka) isFull() bool {
-	return banka.messageCount == MAX_MESSAGE_COUNT_PER_BANKA
+	return banka.messageCount == MaxMessageCountPerBanka
 }
 
 func (banka *Banka) putMessage(buffer Buffer) error {
@@ -108,7 +111,7 @@ func (banka *Banka) putMessage(buffer Buffer) error {
 func newBanka(id int) *Banka {
 	return &Banka{
 		id:             id,
-		messageOffsets: make([]int, MAX_MESSAGE_COUNT_PER_BANKA+1),
+		messageOffsets: make([]int, MaxMessageCountPerBanka+1),
 	}
 }
 
@@ -193,27 +196,117 @@ type User struct {
 	state        int
 	buffer       []byte
 	writtenBytes int
+	sendQueue    chan *PooledBuffer
 }
 
 func NewUser(conn net.Conn, id int) *User {
 	return &User{
-		id:     id,
-		state:  ReceivingMessage,
-		conn:   conn,
-		buffer: make([]byte, MAX_MESSAGE_BUFFER_SIZE),
+		id:        id,
+		state:     ReceivingMessage,
+		conn:      conn,
+		buffer:    make([]byte, MaxMessageBufferSize),
+		sendQueue: make(chan *PooledBuffer, UserSendQueueCapacity),
 	}
 }
 
-func handlePacket(author *User, packet Packet) error {
+var noSplitCharacterFoundError = errors.New("no split character found")
+
+func getSplitPosition(message string) (int, error) {
+	for i := 0; i < len(message); i++ {
+		if message[i] == '|' {
+			return i, nil
+		}
+	}
+
+	return 0, noSplitCharacterFoundError
+}
+
+func getKeywords(message string) []string {
+	return strings.Fields(message)
+}
+
+const (
+	PutMessage = iota
+)
+
+const (
+	PutMessageKeyword = "PUT"
+)
+
+func getActionType(keywords []string) (int, error) {
+	count := len(keywords)
+
+	if count == 1 && keywords[0] == PutMessageKeyword {
+		return PutMessage, nil
+	}
+
+	return 0, errors.New("invalid keywords")
+}
+
+func handlePacket(packet Packet, pool *BufferPool, pogreb *Pogreb) error {
+	author := packet.author
 	if author.state == Closed {
 		return nil
 	}
 
+	pooledBuffer := packet.pooledBuffer
+	defer pool.returnBuffer(pooledBuffer)
+
+	buffer := pooledBuffer.buffer
+	if !utf8.Valid(buffer.data[:buffer.dataLength]) {
+		sendMessage(author, pool, InvalidUtf8Message)
+		return errors.New("invalid UTF8")
+	}
+
+	message := string(buffer.data[:buffer.dataLength])
+
+	splitPosition, err := getSplitPosition(message)
+	if err != nil {
+		return err
+	}
+
+	payloadBuffer := pool.getBuffer()
+	defer pool.returnBuffer(payloadBuffer)
+
+	keywordPart := message[:splitPosition-1]
+	payloadPart := message[splitPosition+1:]
+
+	payloadLength := copy(payloadBuffer.buffer.data, payloadPart)
+	payloadBuffer.buffer.dataLength = payloadLength
+
+	keywords := getKeywords(keywordPart)
+	actionType, err := getActionType(keywords)
+
+	if err != nil {
+		return err
+	}
+
+	switch actionType {
+	case PutMessage:
+		err := pogreb.putMessage(*payloadBuffer.buffer)
+		if err != nil {
+			fmt.Printf("Ошибка при записи в погреб: %s\n", err.Error())
+			return err
+		}
+	}
+
+	sendMessage(author, pool, SuccessMessage)
 	return nil
 }
 
+const InvalidUtf8Message = "INVALID UTF-8"
+const SuccessMessage = "URA"
+
+func sendMessage(target *User, pool *BufferPool, message string) {
+	pooledBuffer := pool.getBuffer()
+	buffer := pooledBuffer.buffer
+	n := copy(buffer.data, message)
+	buffer.dataLength = n
+	target.sendQueue <- pooledBuffer
+}
+
 func main() {
-	messageChannel := make(chan Packet, MAX_MESSAGE_BUFFER_COUNT)
+	messageChannel := make(chan Packet, MaxMessageBufferCount)
 	bufferPool := newBufferPool()
 
 	pogreb := newPogreb()
@@ -222,12 +315,12 @@ func main() {
 	go func() {
 		for packet := range messageChannel {
 			pooledBuffer := packet.pooledBuffer
-			// fmt.Printf("Получено сообщение: %s\n", string(Buffer))
-
-			err := pogreb.putMessage(*pooledBuffer.buffer)
+			err := handlePacket(packet, bufferPool, pogreb)
 			if err != nil {
-				fmt.Printf("Ошибка при записи в погреб: %s\n", err.Error())
+				fmt.Printf("Не удалось обработать пакет от пользователя [%d]: %s\n", packet.author.id, err.Error())
 			}
+
+			// fmt.Printf("Получено сообщение: %s\n", string(Buffer))
 
 			fmt.Printf("Количество банок в погребе: %d\n", len(pogreb.sealed))
 			for processedBankaCount < len(pogreb.sealed) {
@@ -266,33 +359,56 @@ func main() {
 	}
 }
 
-func handleConnection(conn net.Conn, messageChannel chan Packet, bufferPool BufferPool, id int) {
-	defer conn.Close()
+func (user *User) closeConnection() {
+	err := user.conn.Close()
+	if err != nil {
+		fmt.Printf("Ошибка при закрытии сокета пользователя: %s\n", err.Error())
+	}
+	user.state = Closed
 
+	fmt.Printf("Принудительно закрыто соединение с пользователем [%d]\n", user.id)
+}
+
+func handleConnection(conn net.Conn, messageChannel chan Packet, bufferPool *BufferPool, id int) {
 	user := NewUser(conn, id)
 
-	for {
-		pooledBuffer := bufferPool.getBuffer()
-		buffer := pooledBuffer.buffer
-
-		n, err := conn.Read(buffer.data)
-		buffer.dataLength = n
-
-		if n == 0 || err == io.EOF {
-			fmt.Printf("%s отключился\n", conn.RemoteAddr())
-			bufferPool.returnBuffer(pooledBuffer)
-			break
+	go func() {
+		for user.state != Closed {
+			for pooledBuffer := range user.sendQueue {
+				buffer := pooledBuffer.buffer
+				_, err := conn.Write(buffer.data[:buffer.dataLength])
+				if err != nil {
+					fmt.Println("Ошибка отправки данных:", err)
+					user.closeConnection()
+				}
+			}
 		}
+	}()
 
-		if err != nil {
-			fmt.Println("Ошибка чтения данных:", err)
-			bufferPool.returnBuffer(pooledBuffer)
-			break
-		}
+	go func() {
+		for user.state != Closed {
+			pooledBuffer := bufferPool.getBuffer()
+			buffer := pooledBuffer.buffer
 
-		messageChannel <- Packet{
-			pooledBuffer: pooledBuffer,
-			author:       user,
+			n, err := conn.Read(buffer.data)
+			buffer.dataLength = n
+
+			if n == 0 || err == io.EOF {
+				fmt.Printf("%s отключился\n", conn.RemoteAddr())
+				bufferPool.returnBuffer(pooledBuffer)
+				break
+			}
+
+			if err != nil {
+				fmt.Println("Ошибка чтения данных:", err)
+				bufferPool.returnBuffer(pooledBuffer)
+				break
+			}
+
+			messageChannel <- Packet{
+				pooledBuffer: pooledBuffer,
+				author:       user,
+			}
 		}
-	}
+	}()
 }
