@@ -12,12 +12,56 @@ import (
 
 const MAX_MESSAGE_BUFFER_SIZE = 2048
 const MAX_MESSAGE_BUFFER_COUNT = 1024 * 1024
-const MAX_MESSAGE_COUNT_PER_BANKA = 1024
+const MAX_MESSAGE_COUNT_PER_BANKA = 2
 
-type Buffer = []byte
-type BufferPointer struct {
-	index  int
-	length int
+type Buffer struct {
+	data       []byte
+	dataLength int
+}
+
+type PooledBuffer struct {
+	buffer    *Buffer
+	poolIndex int
+}
+
+type Packet struct {
+	author       *User
+	pooledBuffer *PooledBuffer
+}
+
+type BufferPool struct {
+	freeBuffers chan int
+	buffers     []*PooledBuffer
+}
+
+func newBufferPool() BufferPool {
+	freeBuffers := make(chan int, MAX_MESSAGE_BUFFER_COUNT)
+	buffers := make([]*PooledBuffer, MAX_MESSAGE_BUFFER_COUNT)
+	for i := 0; i < MAX_MESSAGE_BUFFER_COUNT; i++ {
+		buffer := make([]byte, MAX_MESSAGE_BUFFER_SIZE)
+		buffers[i] = &PooledBuffer{
+			buffer: &Buffer{
+				data:       buffer,
+				dataLength: 0,
+			},
+			poolIndex: i,
+		}
+		freeBuffers <- i
+	}
+
+	return BufferPool{
+		freeBuffers: freeBuffers,
+		buffers:     buffers,
+	}
+}
+
+func (pool *BufferPool) getBuffer() *PooledBuffer {
+	index := <-pool.freeBuffers
+	return pool.buffers[index]
+}
+
+func (pool *BufferPool) returnBuffer(buffer *PooledBuffer) {
+	pool.freeBuffers <- buffer.poolIndex
 }
 
 type Banka struct {
@@ -30,8 +74,8 @@ type Banka struct {
 	sealDate       time.Time
 }
 
-var bankaIsSealedError = errors.New("Banka is already sealed")
-var bankaIsFullError = errors.New("Banka is already full")
+var bankaIsSealedError = errors.New("banka is already sealed")
+var bankaIsFullError = errors.New("banka is already full")
 
 func (banka *Banka) isFull() bool {
 	return banka.messageCount == MAX_MESSAGE_COUNT_PER_BANKA
@@ -50,10 +94,10 @@ func (banka *Banka) putMessage(buffer Buffer) error {
 	}
 
 	// TODO: переиспользовать буфферы для банок.
-	banka.buffer = append(banka.buffer, buffer...)
+	banka.buffer = append(banka.buffer, buffer.data[:buffer.dataLength]...)
 
 	offset := banka.messageOffsets[banka.messageCount]
-	offset += len(buffer)
+	offset += buffer.dataLength
 
 	banka.messageCount++
 	banka.messageOffsets[banka.messageCount] = offset
@@ -135,24 +179,52 @@ func processBanka(banka *Banka) error {
 	return nil
 }
 
-func main() {
-	messageChannel := make(chan BufferPointer, MAX_MESSAGE_BUFFER_COUNT)
-	freeBuffers := make(chan int, MAX_MESSAGE_BUFFER_COUNT)
-	buffers := make([]Buffer, MAX_MESSAGE_BUFFER_COUNT)
-	for i := 0; i < MAX_MESSAGE_BUFFER_COUNT; i++ {
-		buffers[i] = make([]byte, MAX_MESSAGE_BUFFER_SIZE)
-		freeBuffers <- i
+const (
+	Uninitialized = iota
+	WaitingForMessage
+	ReceivingMessage
+	SendingMessage
+	Closed
+)
+
+type User struct {
+	id           int
+	conn         net.Conn
+	state        int
+	buffer       []byte
+	writtenBytes int
+}
+
+func NewUser(conn net.Conn, id int) *User {
+	return &User{
+		id:     id,
+		state:  ReceivingMessage,
+		conn:   conn,
+		buffer: make([]byte, MAX_MESSAGE_BUFFER_SIZE),
 	}
+}
+
+func handlePacket(author *User, packet Packet) error {
+	if author.state == Closed {
+		return nil
+	}
+
+	return nil
+}
+
+func main() {
+	messageChannel := make(chan Packet, MAX_MESSAGE_BUFFER_COUNT)
+	bufferPool := newBufferPool()
 
 	pogreb := newPogreb()
 	processedBankaCount := 0
 
 	go func() {
-		for pointer := range messageChannel {
-			buffer := buffers[pointer.index][:pointer.length]
+		for packet := range messageChannel {
+			pooledBuffer := packet.pooledBuffer
 			// fmt.Printf("Получено сообщение: %s\n", string(Buffer))
 
-			err := pogreb.putMessage(buffer)
+			err := pogreb.putMessage(*pooledBuffer.buffer)
 			if err != nil {
 				fmt.Printf("Ошибка при записи в погреб: %s\n", err.Error())
 			}
@@ -166,7 +238,7 @@ func main() {
 				processedBankaCount++
 			}
 
-			freeBuffers <- pointer.index
+			bufferPool.returnBuffer(pooledBuffer)
 		}
 	}()
 
@@ -190,31 +262,37 @@ func main() {
 		}
 		fmt.Println("Новое соединение:", cnt, conn.RemoteAddr())
 		cnt++
-		go handleConnection(conn, messageChannel, freeBuffers, buffers)
+		go handleConnection(conn, messageChannel, bufferPool, cnt)
 	}
 }
 
-func handleConnection(conn net.Conn, messageChannel chan BufferPointer, freeBuffers chan int, buffers []Buffer) {
+func handleConnection(conn net.Conn, messageChannel chan Packet, bufferPool BufferPool, id int) {
 	defer conn.Close()
 
-	for {
-		index := <-freeBuffers
-		buffer := buffers[index]
+	user := NewUser(conn, id)
 
-		n, err := conn.Read(buffer)
+	for {
+		pooledBuffer := bufferPool.getBuffer()
+		buffer := pooledBuffer.buffer
+
+		n, err := conn.Read(buffer.data)
+		buffer.dataLength = n
 
 		if n == 0 || err == io.EOF {
-			freeBuffers <- index
 			fmt.Printf("%s отключился\n", conn.RemoteAddr())
+			bufferPool.returnBuffer(pooledBuffer)
 			break
 		}
 
 		if err != nil {
 			fmt.Println("Ошибка чтения данных:", err)
-			freeBuffers <- index
+			bufferPool.returnBuffer(pooledBuffer)
 			break
 		}
 
-		messageChannel <- BufferPointer{index, n}
+		messageChannel <- Packet{
+			pooledBuffer: pooledBuffer,
+			author:       user,
+		}
 	}
 }
